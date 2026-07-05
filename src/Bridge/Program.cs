@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
@@ -182,9 +183,19 @@ namespace HapticsBridge
         private volatile bool sessionDead;
         private Thread thread;
         private TcpListener listener;
-        private volatile TcpClient currentClient;
         private volatile BufferedWaveProvider chimeBuffer;
         private string openedDeviceId;
+
+        // One lane per connected game instance (e.g. coop host + client on
+        // one machine); their streams are mixed into the same controller.
+        private sealed class Lane
+        {
+            public TcpClient Client;
+            public BufferedWaveProvider Buffer;
+            public ISampleProvider Input;
+        }
+        private readonly List<Lane> lanes = new List<Lane>();
+        private int clientCount;
 
         public Engine(string[] args)
         {
@@ -250,19 +261,14 @@ namespace HapticsBridge
                     Log(string.Format("Routing: haptic L -> ch{0}, haptic R -> ch{1}", leftCh + 1, rightCh + 1));
 
                     var stereoFloat = WaveFormat.CreateIeeeFloatWaveFormat(Program.SampleRate, 2);
-                    var gameBuffer = new BufferedWaveProvider(stereoFloat)
-                    {
-                        BufferDuration = TimeSpan.FromMilliseconds(Math.Max(bufferMs * 4, 250)),
-                        DiscardOnBufferOverflow = true,
-                    };
                     // Separate lane for the chime so it can play any time,
-                    // including while a game is streaming.
+                    // including while games are streaming.
                     var chime = new BufferedWaveProvider(stereoFloat)
                     {
                         BufferDuration = TimeSpan.FromMilliseconds(500),
                         DiscardOnBufferOverflow = true,
                     };
-                    var mixer = new MixingSampleProvider(new[] { gameBuffer.ToSampleProvider(), chime.ToSampleProvider() })
+                    var mixer = new MixingSampleProvider(new[] { chime.ToSampleProvider() })
                     {
                         ReadFully = true,
                     };
@@ -285,7 +291,7 @@ namespace HapticsBridge
                         output.Init(provider);
                         output.Play();
 
-                        var watchdog = new Thread(delegate () { WatchdogLoop(gameBuffer, chime); })
+                        var watchdog = new Thread(delegate () { WatchdogLoop(chime); })
                         { IsBackground = true, Name = "HapticsWatchdog" };
                         watchdog.Start();
 
@@ -301,39 +307,33 @@ namespace HapticsBridge
                         Log("Listening on 127.0.0.1:" + port);
                         state = State.Listening;
 
-                        var block = new byte[480 * 2 * 4];
                         while (!stop && !sessionDead)
                         {
                             while (!stop && !sessionDead && !listener.Pending())
                                 Thread.Sleep(100);
                             if (stop || sessionDead) break;
 
-                            using (var client = listener.AcceptTcpClient())
+                            var client = listener.AcceptTcpClient();
+                            client.NoDelay = true;
+                            var lane = new Lane
                             {
-                                currentClient = client;
-                                client.NoDelay = true;
-                                Log("Game connected");
-                                state = State.GameConnected;
-                                try
+                                Client = client,
+                                Buffer = new BufferedWaveProvider(stereoFloat)
                                 {
-                                    using (var stream = client.GetStream())
-                                    {
-                                        int read;
-                                        while (!stop && !sessionDead && (read = ReadBlock(stream, block)) > 0)
-                                        {
-                                            if (gameBuffer.BufferedDuration.TotalMilliseconds > bufferMs * 2)
-                                                gameBuffer.ClearBuffer();
-                                            gameBuffer.AddSamples(block, 0, read);
-                                        }
-                                    }
-                                }
-                                catch (IOException) { }
-                                catch (ObjectDisposedException) { }
-                                currentClient = null;
-                                gameBuffer.ClearBuffer();
-                                Log("Game disconnected");
-                                state = State.Listening;
-                            }
+                                    BufferDuration = TimeSpan.FromMilliseconds(Math.Max(bufferMs * 4, 250)),
+                                    DiscardOnBufferOverflow = true,
+                                },
+                            };
+                            lane.Input = lane.Buffer.ToSampleProvider();
+                            lock (lanes) { lanes.Add(lane); }
+                            mixer.AddMixerInput(lane.Input);
+                            int n = Interlocked.Increment(ref clientCount);
+                            Log("Game connected (" + n + " instance" + (n > 1 ? "s" : "") + ")");
+                            state = State.GameConnected;
+
+                            var clientThread = new Thread(delegate () { ClientLoop(lane, mixer); })
+                            { IsBackground = true, Name = "HapticsClient" };
+                            clientThread.Start();
                         }
                     }
                 }
@@ -344,8 +344,14 @@ namespace HapticsBridge
                 }
                 finally
                 {
-                    sessionDead = true;   // stops the watchdog
+                    sessionDead = true;   // stops the watchdog and client loops
                     chimeBuffer = null;
+                    lock (lanes)
+                    {
+                        foreach (var lane in lanes)
+                            try { lane.Client.Close(); } catch { }
+                        lanes.Clear();
+                    }
                     try { if (listener != null) listener.Stop(); } catch { }
                     listener = null;
                 }
@@ -354,6 +360,37 @@ namespace HapticsBridge
                     state = State.NoDevice;
                     SleepInterruptible(2000);
                 }
+            }
+        }
+
+        /// <summary>Reads one game instance's stream into its mixer lane until it disconnects.</summary>
+        private void ClientLoop(Lane lane, MixingSampleProvider mixer)
+        {
+            var block = new byte[480 * 2 * 4];
+            try
+            {
+                using (var stream = lane.Client.GetStream())
+                {
+                    int read;
+                    while (!stop && !sessionDead && (read = ReadBlock(stream, block)) > 0)
+                    {
+                        if (lane.Buffer.BufferedDuration.TotalMilliseconds > bufferMs * 2)
+                            lane.Buffer.ClearBuffer();
+                        lane.Buffer.AddSamples(block, 0, read);
+                    }
+                }
+            }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
+            finally
+            {
+                try { mixer.RemoveMixerInput(lane.Input); } catch { }
+                lock (lanes) { lanes.Remove(lane); }
+                try { lane.Client.Close(); } catch { }
+                int n = Interlocked.Decrement(ref clientCount);
+                Log("Game disconnected (" + n + " remaining)");
+                if (!sessionDead)
+                    state = n > 0 ? State.GameConnected : State.Listening;
             }
         }
 
@@ -366,7 +403,11 @@ namespace HapticsBridge
             if (sessionDead) return;
             sessionDead = true;
             Log("Reopening audio session: " + why);
-            try { var c = currentClient; if (c != null) c.Close(); } catch { }
+            lock (lanes)
+            {
+                foreach (var lane in lanes)
+                    try { lane.Client.Close(); } catch { }
+            }
             try { if (listener != null) listener.Stop(); } catch { }
         }
 
@@ -375,7 +416,7 @@ namespace HapticsBridge
         /// endpoint being replaced (DSX recreating its virtual device, USB
         /// replug) and a zombie session where the render clock stops pulling.
         /// </summary>
-        private void WatchdogLoop(BufferedWaveProvider gameBuffer, BufferedWaveProvider chime)
+        private void WatchdogLoop(BufferedWaveProvider chime)
         {
             long lastBuffered = -1;
             int stagnant = 0;
@@ -393,7 +434,12 @@ namespace HapticsBridge
                         if (live.ID != openedDeviceId) { KillSession("device replaced (new endpoint instance)"); return; }
                     }
 
-                    long buffered = gameBuffer.BufferedBytes + chime.BufferedBytes;
+                    long buffered = chime.BufferedBytes;
+                    lock (lanes)
+                    {
+                        foreach (var lane in lanes)
+                            buffered += lane.Buffer.BufferedBytes;
+                    }
                     if (buffered > 0 && buffered == lastBuffered)
                     {
                         if (++stagnant >= 2) { KillSession("audio session stalled (buffer not draining)"); return; }
