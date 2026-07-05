@@ -17,6 +17,7 @@ namespace SilksongPS5Haptics
         internal static ConfigEntry<int> BridgePort;
         internal static ConfigEntry<string> ClipsPath;
         internal static ConfigEntry<bool> AutoStartBridge;
+        internal static ConfigEntry<bool> SuspendInputWhenUnfocused;
 
         private void Awake()
         {
@@ -33,6 +34,8 @@ namespace SilksongPS5Haptics
 
             AutoStartBridge = Config.Bind("General", "AutoStartBridge", true,
                 "Launch HapticsBridge.exe (system tray) automatically when the game starts.");
+            SuspendInputWhenUnfocused = Config.Bind("Multi-instance", "SuspendInputWhenUnfocused", false,
+                "Ignore controller input while this game window is not focused. Enable on BOTH installs when running two instances (e.g. coop host+client) on one PC with one controller: whichever window you click gets the pad. Leave off for normal play or local two-player with two controllers.");
 
             string clips = ClipsPath.Value;
             if (string.IsNullOrEmpty(clips))
@@ -54,6 +57,11 @@ namespace SilksongPS5Haptics
                 HapticEngine.CachedTimeScale = Time.timeScale;
                 HapticEngine.CachedStrengthMultiplier = VibrationManager.StrengthMultiplier;
                 HapticEngine.CachedMasterGain = MasterGain.Value;
+
+                // Re-assert every frame: the game's InControlManager writes its
+                // own (false) value on setup, order-dependent with plugin load.
+                if (SuspendInputWhenUnfocused.Value && InControl.InputManager.IsSetup)
+                    InControl.InputManager.SuspendInBackground = true;
             }
             catch
             {
