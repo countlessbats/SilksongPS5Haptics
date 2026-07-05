@@ -179,9 +179,12 @@ namespace HapticsBridge
         private readonly string map;
         private readonly bool chimeOnStart;
         private volatile bool stop;
-        private volatile bool chimeRequested;
+        private volatile bool sessionDead;
         private Thread thread;
         private TcpListener listener;
+        private volatile TcpClient currentClient;
+        private volatile BufferedWaveProvider chimeBuffer;
+        private string openedDeviceId;
 
         public Engine(string[] args)
         {
@@ -207,7 +210,12 @@ namespace HapticsBridge
             try { if (listener != null) listener.Stop(); } catch { }
         }
 
-        public void RequestChime() { chimeRequested = true; }
+        public void RequestChime()
+        {
+            var cb = chimeBuffer;
+            if (cb == null) return;
+            new Thread(delegate () { try { Chime.Play(cb); } catch { } }) { IsBackground = true }.Start();
+        }
 
         private void Run()
         {
@@ -241,32 +249,50 @@ namespace HapticsBridge
                     else { leftCh = 2; rightCh = 3; }
                     Log(string.Format("Routing: haptic L -> ch{0}, haptic R -> ch{1}", leftCh + 1, rightCh + 1));
 
-                    var buffer = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(Program.SampleRate, 2))
+                    var stereoFloat = WaveFormat.CreateIeeeFloatWaveFormat(Program.SampleRate, 2);
+                    var gameBuffer = new BufferedWaveProvider(stereoFloat)
                     {
                         BufferDuration = TimeSpan.FromMilliseconds(Math.Max(bufferMs * 4, 250)),
                         DiscardOnBufferOverflow = true,
                     };
-                    ISampleProvider source = buffer.ToSampleProvider();
+                    // Separate lane for the chime so it can play any time,
+                    // including while a game is streaming.
+                    var chime = new BufferedWaveProvider(stereoFloat)
+                    {
+                        BufferDuration = TimeSpan.FromMilliseconds(500),
+                        DiscardOnBufferOverflow = true,
+                    };
+                    var mixer = new MixingSampleProvider(new[] { gameBuffer.ToSampleProvider(), chime.ToSampleProvider() })
+                    {
+                        ReadFully = true,
+                    };
+                    ISampleProvider source = mixer;
                     if (mix.SampleRate != Program.SampleRate)
                         source = new WdlResamplingSampleProvider(source, mix.SampleRate);
                     var provider = new ChannelMapWaveProvider(source, mix, leftCh, rightCh);
 
-                    bool deviceLost = false;
+                    sessionDead = false;
+                    openedDeviceId = device.ID;
+                    chimeBuffer = chime;
+
                     using (var output = new WasapiOut(device, AudioClientShareMode.Shared, true, 20))
                     {
                         output.PlaybackStopped += delegate (object s, StoppedEventArgs e)
                         {
-                            deviceLost = true;
-                            try { if (listener != null) listener.Stop(); } catch { }
                             if (e.Exception != null) Log("Playback stopped: " + e.Exception.Message);
+                            KillSession("playback stopped");
                         };
                         output.Init(provider);
                         output.Play();
 
+                        var watchdog = new Thread(delegate () { WatchdogLoop(gameBuffer, chime); })
+                        { IsBackground = true, Name = "HapticsWatchdog" };
+                        watchdog.Start();
+
                         if (chimeOnStart && !firstChimePlayed)
                         {
                             firstChimePlayed = true;
-                            Chime.Play(buffer);
+                            Chime.Play(chime);
                             Log("Startup chime played");
                         }
 
@@ -276,21 +302,15 @@ namespace HapticsBridge
                         state = State.Listening;
 
                         var block = new byte[480 * 2 * 4];
-                        while (!stop && !deviceLost)
+                        while (!stop && !sessionDead)
                         {
-                            while (!stop && !deviceLost && !listener.Pending())
-                            {
-                                if (chimeRequested)
-                                {
-                                    chimeRequested = false;
-                                    Chime.Play(buffer);
-                                }
+                            while (!stop && !sessionDead && !listener.Pending())
                                 Thread.Sleep(100);
-                            }
-                            if (stop || deviceLost) break;
+                            if (stop || sessionDead) break;
 
                             using (var client = listener.AcceptTcpClient())
                             {
+                                currentClient = client;
                                 client.NoDelay = true;
                                 Log("Game connected");
                                 state = State.GameConnected;
@@ -299,16 +319,18 @@ namespace HapticsBridge
                                     using (var stream = client.GetStream())
                                     {
                                         int read;
-                                        while (!stop && (read = ReadBlock(stream, block)) > 0)
+                                        while (!stop && !sessionDead && (read = ReadBlock(stream, block)) > 0)
                                         {
-                                            if (buffer.BufferedDuration.TotalMilliseconds > bufferMs * 2)
-                                                buffer.ClearBuffer();
-                                            buffer.AddSamples(block, 0, read);
+                                            if (gameBuffer.BufferedDuration.TotalMilliseconds > bufferMs * 2)
+                                                gameBuffer.ClearBuffer();
+                                            gameBuffer.AddSamples(block, 0, read);
                                         }
                                     }
                                 }
                                 catch (IOException) { }
-                                buffer.ClearBuffer();
+                                catch (ObjectDisposedException) { }
+                                currentClient = null;
+                                gameBuffer.ClearBuffer();
                                 Log("Game disconnected");
                                 state = State.Listening;
                             }
@@ -322,6 +344,8 @@ namespace HapticsBridge
                 }
                 finally
                 {
+                    sessionDead = true;   // stops the watchdog
+                    chimeBuffer = null;
                     try { if (listener != null) listener.Stop(); } catch { }
                     listener = null;
                 }
@@ -329,6 +353,61 @@ namespace HapticsBridge
                 {
                     state = State.NoDevice;
                     SleepInterruptible(2000);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Tear down the current audio session so the outer loop reopens the
+        /// device. Unblocks the accept/read loops by closing their sockets.
+        /// </summary>
+        private void KillSession(string why)
+        {
+            if (sessionDead) return;
+            sessionDead = true;
+            Log("Reopening audio session: " + why);
+            try { var c = currentClient; if (c != null) c.Close(); } catch { }
+            try { if (listener != null) listener.Stop(); } catch { }
+        }
+
+        /// <summary>
+        /// Detects the two silent-death modes WASAPI won't report: the
+        /// endpoint being replaced (DSX recreating its virtual device, USB
+        /// replug) and a zombie session where the render clock stops pulling.
+        /// </summary>
+        private void WatchdogLoop(BufferedWaveProvider gameBuffer, BufferedWaveProvider chime)
+        {
+            long lastBuffered = -1;
+            int stagnant = 0;
+            while (!stop && !sessionDead)
+            {
+                Thread.Sleep(1500);
+                if (stop || sessionDead) return;
+                try
+                {
+                    using (var enumerator = new MMDeviceEnumerator())
+                    {
+                        var live = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
+                            .FirstOrDefault(d => d.FriendlyName.IndexOf(deviceMatch, StringComparison.OrdinalIgnoreCase) >= 0);
+                        if (live == null) { KillSession("device removed"); return; }
+                        if (live.ID != openedDeviceId) { KillSession("device replaced (new endpoint instance)"); return; }
+                    }
+
+                    long buffered = gameBuffer.BufferedBytes + chime.BufferedBytes;
+                    if (buffered > 0 && buffered == lastBuffered)
+                    {
+                        if (++stagnant >= 2) { KillSession("audio session stalled (buffer not draining)"); return; }
+                    }
+                    else
+                    {
+                        stagnant = 0;
+                    }
+                    lastBuffered = buffered;
+                }
+                catch (Exception e)
+                {
+                    KillSession("watchdog error: " + e.Message);
+                    return;
                 }
             }
         }
