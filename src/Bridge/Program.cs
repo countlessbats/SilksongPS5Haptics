@@ -177,6 +177,8 @@ namespace HapticsBridge
         private readonly string deviceMatch;
         private readonly int port;
         private readonly int bufferMs;
+        private readonly int latencyMs;
+        private readonly bool eventSync;
         private readonly string map;
         private readonly bool chimeOnStart;
         private volatile bool stop;
@@ -200,9 +202,18 @@ namespace HapticsBridge
         public Engine(string[] args)
         {
             deviceMatch = Program.GetArg(args, "--device") ?? "DualSense";
-            int p, b;
+            int p, b, l;
             port = int.TryParse(Program.GetArg(args, "--port"), out p) ? p : 48111;
             bufferMs = int.TryParse(Program.GetArg(args, "--buffer-ms"), out b) ? b : 60;
+            // Timer/push-driven WASAPI at 100 ms by default. Event-sync at low
+            // latency (the old 20 ms default) silently wedges on Bluetooth
+            // DualSense endpoints: the endpoint stops delivering buffer-ready
+            // events, the render client stops pulling, and haptics freeze.
+            // Timer-driven doesn't depend on that callback, so it survives BT
+            // jitter; on wired endpoints it's indistinguishable. Opt back into
+            // event-sync with --event-sync and tune latency with --latency-ms.
+            latencyMs = int.TryParse(Program.GetArg(args, "--latency-ms"), out l) ? l : 100;
+            eventSync = args.Contains("--event-sync");
             map = Program.GetArg(args, "--map") ?? "auto";
             chimeOnStart = !args.Contains("--no-chime");
             try { File.WriteAllText(LogPath, ""); } catch { }
@@ -281,7 +292,8 @@ namespace HapticsBridge
                     openedDeviceId = device.ID;
                     chimeBuffer = chime;
 
-                    using (var output = new WasapiOut(device, AudioClientShareMode.Shared, true, 20))
+                    Log(string.Format("Output: {0}-driven, {1} ms latency", eventSync ? "event" : "timer", latencyMs));
+                    using (var output = new WasapiOut(device, AudioClientShareMode.Shared, eventSync, latencyMs))
                     {
                         output.PlaybackStopped += delegate (object s, StoppedEventArgs e)
                         {
@@ -412,14 +424,11 @@ namespace HapticsBridge
         }
 
         /// <summary>
-        /// Detects the two silent-death modes WASAPI won't report: the
-        /// endpoint being replaced (DSX recreating its virtual device, USB
-        /// replug) and a zombie session where the render clock stops pulling.
+        /// Detects endpoint replacement, which happens when DSX recreates its
+        /// virtual device or a USB controller is unplugged/replugged.
         /// </summary>
         private void WatchdogLoop(BufferedWaveProvider chime)
         {
-            long lastBuffered = -1;
-            int stagnant = 0;
             while (!stop && !sessionDead)
             {
                 Thread.Sleep(1500);
@@ -433,22 +442,6 @@ namespace HapticsBridge
                         if (live == null) { KillSession("device removed"); return; }
                         if (live.ID != openedDeviceId) { KillSession("device replaced (new endpoint instance)"); return; }
                     }
-
-                    long buffered = chime.BufferedBytes;
-                    lock (lanes)
-                    {
-                        foreach (var lane in lanes)
-                            buffered += lane.Buffer.BufferedBytes;
-                    }
-                    if (buffered > 0 && buffered == lastBuffered)
-                    {
-                        if (++stagnant >= 2) { KillSession("audio session stalled (buffer not draining)"); return; }
-                    }
-                    else
-                    {
-                        stagnant = 0;
-                    }
-                    lastBuffered = buffered;
                 }
                 catch (Exception e)
                 {
