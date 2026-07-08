@@ -82,6 +82,7 @@ namespace HapticsBridge
         private readonly Icon iconGreen = MakeIcon(Color.FromArgb(70, 190, 90));
         private Engine.State lastState = (Engine.State)(-1);
         private string lastDetail;
+        private readonly List<ToolStripMenuItem> presetItems = new List<ToolStripMenuItem>();
 
         public TrayContext(string[] args)
         {
@@ -89,6 +90,7 @@ namespace HapticsBridge
 
             var menu = new ContextMenuStrip();
             menu.Items.Add("Play test chime", null, delegate { engine.RequestChime(); });
+            menu.Items.Add(BuildLatencyMenu());
             menu.Items.Add("Open log", null, delegate
             {
                 System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Engine.LogPath) { UseShellExecute = true });
@@ -109,6 +111,47 @@ namespace HapticsBridge
             poll.Start();
 
             engine.Start();
+        }
+
+        /// <summary>
+        /// "Latency" submenu: grayed help text explaining the trade-off, then
+        /// one checkable item per preset. Default (Reliable) needs no touching;
+        /// the guidance tells the user when they'd want to move off it.
+        /// </summary>
+        private ToolStripMenuItem BuildLatencyMenu()
+        {
+            var menu = new ToolStripMenuItem("Latency");
+
+            string[] help =
+            {
+                "Leave on Reliable unless haptics lag or glitch.",
+                "Higher = steadier (Bluetooth, busy PCs).",
+                "Lower = snappier, but can crackle or cut out —",
+                "especially on Bluetooth. Minimal is wired-only.",
+            };
+            foreach (var line in help)
+                menu.DropDownItems.Add(new ToolStripMenuItem(line) { Enabled = false });
+            menu.DropDownItems.Add(new ToolStripSeparator());
+
+            foreach (var p in Engine.Presets)
+            {
+                string key = p.Key;
+                var item = new ToolStripMenuItem(p.Label + " — " + p.Blurb);
+                item.Tag = key;
+                item.Click += delegate { engine.ApplyPreset(key); RefreshPresetChecks(); };
+                presetItems.Add(item);
+                menu.DropDownItems.Add(item);
+            }
+            menu.DropDownOpening += delegate { RefreshPresetChecks(); };
+            RefreshPresetChecks();
+            return menu;
+        }
+
+        private void RefreshPresetChecks()
+        {
+            string cur = engine.CurrentPresetKey;
+            foreach (var it in presetItems)
+                it.Checked = ((string)it.Tag == cur);
         }
 
         private void UpdateTray()
@@ -176,14 +219,36 @@ namespace HapticsBridge
 
         private readonly string deviceMatch;
         private readonly int port;
-        private readonly int bufferMs;
-        private readonly int latencyMs;
-        private readonly bool eventSync;
-        private readonly bool keepalive;
+        private volatile int bufferMs;
+        private volatile int latencyMs;
+        private volatile bool eventSync;
+        private readonly bool hidAssert;
         private readonly string map;
         private readonly bool chimeOnStart;
         private volatile bool stop;
         private volatile bool sessionDead;
+        private volatile bool fastReopen;   // set when a preset change forces a reopen
+
+        /// <summary>A named latency/reliability trade-off point (see the tray menu).</summary>
+        public struct LatencyPreset
+        {
+            public readonly string Key, Label, Blurb;
+            public readonly int LatencyMs, BufferMs;
+            public readonly bool EventSync;
+            public LatencyPreset(string key, string label, string blurb, int latencyMs, int bufferMs, bool eventSync)
+            { Key = key; Label = label; Blurb = blurb; LatencyMs = latencyMs; BufferMs = bufferMs; EventSync = eventSync; }
+        }
+
+        // Ordered safest -> snappiest. "Reliable" matches the built-in defaults.
+        public static readonly LatencyPreset[] Presets =
+        {
+            new LatencyPreset("reliable", "Reliable", "survives Bluetooth & busy PCs (default)", 100, 60, false),
+            new LatencyPreset("snappy",   "Snappy",   "lower latency, best on wired USB",         40, 30, false),
+            new LatencyPreset("minimal",  "Minimal",  "lowest latency, wired only (may glitch)",  20, 20, true),
+        };
+
+        private static readonly string SettingsPath =
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "latency.cfg");
         private Thread thread;
         private TcpListener listener;
         private volatile BufferedWaveProvider chimeBuffer;
@@ -215,13 +280,59 @@ namespace HapticsBridge
             // event-sync with --event-sync and tune latency with --latency-ms.
             latencyMs = int.TryParse(Program.GetArg(args, "--latency-ms"), out l) ? l : 100;
             eventSync = args.Contains("--event-sync");
-            // Imperceptible pilot tone on the haptic channels; keeps Bluetooth
-            // links from idling on digital silence (which freezes rendering on
-            // some BT stacks until the controller is reconnected).
-            keepalive = !args.Contains("--no-keepalive");
+            // USB pads leave their audio path unpowered until told otherwise,
+            // so ch3/4 audio drains but the actuators stay silent; the bridge
+            // enables audio haptics over HID itself (see DualSenseHid) instead
+            // of depending on DSX. Disable if another app should own the pad.
+            hidAssert = !args.Contains("--no-hid");
             map = Program.GetArg(args, "--map") ?? "auto";
             chimeOnStart = !args.Contains("--no-chime");
             try { File.WriteAllText(LogPath, ""); } catch { }
+            // A saved tray preset overrides the arg/default latency knobs.
+            LoadPreset();
+        }
+
+        private void LoadPreset()
+        {
+            try
+            {
+                if (!File.Exists(SettingsPath)) return;
+                string key = File.ReadAllText(SettingsPath).Trim();
+                foreach (var p in Presets)
+                    if (p.Key == key)
+                    {
+                        latencyMs = p.LatencyMs; bufferMs = p.BufferMs; eventSync = p.EventSync;
+                        return;
+                    }
+            }
+            catch { }
+        }
+
+        /// <summary>The preset whose values match the live settings, or null if a CLI override put us off-grid.</summary>
+        public string CurrentPresetKey
+        {
+            get
+            {
+                foreach (var p in Presets)
+                    if (p.LatencyMs == latencyMs && p.BufferMs == bufferMs && p.EventSync == eventSync) return p.Key;
+                return null;
+            }
+        }
+
+        /// <summary>Switch preset, persist it, and reopen the session so it takes effect now.</summary>
+        public void ApplyPreset(string key)
+        {
+            foreach (var p in Presets)
+                if (p.Key == key)
+                {
+                    latencyMs = p.LatencyMs; bufferMs = p.BufferMs; eventSync = p.EventSync;
+                    try { File.WriteAllText(SettingsPath, key); } catch { }
+                    Log(string.Format("Latency preset: {0} ({1}-driven, {2} ms latency, {3} ms buffer)",
+                        p.Label, eventSync ? "event" : "timer", latencyMs, bufferMs));
+                    fastReopen = true;
+                    KillSession("latency preset changed");
+                    return;
+                }
         }
 
         public void Start()
@@ -293,14 +404,14 @@ namespace HapticsBridge
                     ISampleProvider source = mixer;
                     if (mix.SampleRate != Program.SampleRate)
                         source = new WdlResamplingSampleProvider(source, mix.SampleRate);
-                    var provider = new ChannelMapWaveProvider(source, mix, leftCh, rightCh, keepalive);
+                    var provider = new ChannelMapWaveProvider(source, mix, leftCh, rightCh);
 
                     sessionDead = false;
                     sessionStartTick = Environment.TickCount;
                     openedDeviceId = device.ID;
                     chimeBuffer = chime;
 
-                    Log(string.Format("Output: {0}-driven, {1} ms latency, keepalive {2}", eventSync ? "event" : "timer", latencyMs, keepalive ? "on" : "off"));
+                    Log(string.Format("Output: {0}-driven, {1} ms latency", eventSync ? "event" : "timer", latencyMs));
                     using (var output = new WasapiOut(device, AudioClientShareMode.Shared, eventSync, latencyMs))
                     {
                         output.PlaybackStopped += delegate (object s, StoppedEventArgs e)
@@ -310,6 +421,8 @@ namespace HapticsBridge
                         };
                         output.Init(provider);
                         output.Play();
+
+                        if (hidAssert) DualSenseHid.AssertAudioHaptics();
 
                         var watchdog = new Thread(delegate () { WatchdogLoop(output); })
                         { IsBackground = true, Name = "HapticsWatchdog" };
@@ -377,14 +490,25 @@ namespace HapticsBridge
                 }
                 if (!stop)
                 {
-                    // Back off if sessions are dying young (a wedged endpoint
-                    // that re-stalls on every reopen); reset once one survives.
-                    if (Environment.TickCount - sessionStartTick >= 60000)
-                        reopenDelayMs = 2000;
-                    else
-                        reopenDelayMs = Math.Min(reopenDelayMs * 2, 30000);
                     state = State.NoDevice;
-                    SleepInterruptible(reopenDelayMs);
+                    if (fastReopen)
+                    {
+                        // Intentional reopen (preset change) — don't treat it as
+                        // a stall; come straight back with the new settings.
+                        fastReopen = false;
+                        reopenDelayMs = 2000;
+                        SleepInterruptible(250);
+                    }
+                    else
+                    {
+                        // Back off if sessions are dying young (a wedged endpoint
+                        // that re-stalls on every reopen); reset once one survives.
+                        if (Environment.TickCount - sessionStartTick >= 60000)
+                            reopenDelayMs = 2000;
+                        else
+                            reopenDelayMs = Math.Min(reopenDelayMs * 2, 30000);
+                        SleepInterruptible(reopenDelayMs);
+                    }
                 }
             }
         }
@@ -456,6 +580,10 @@ namespace HapticsBridge
                 if (stop || sessionDead) return;
                 try
                 {
+                    // Re-select audio-haptics mode every tick: the game/Steam
+                    // can flip the pad back to rumble emulation at any time.
+                    if (hidAssert) DualSenseHid.AssertAudioHaptics();
+
                     using (var enumerator = new MMDeviceEnumerator())
                     {
                         var live = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)

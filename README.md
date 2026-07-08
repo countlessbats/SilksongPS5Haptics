@@ -66,11 +66,18 @@ Manual install: copy `files/BepInEx` from the zip over your game folder
 | `AutoStartBridge` | true | Launch the tray bridge with the game |
 | `BridgePort` | 48111 | Localhost TCP port |
 
-Bridge flags: `--device <substring>` (default `DualSense`), `--map 12|34|auto`,
-`--buffer-ms <n>` (default 60, lower = less latency), `--latency-ms <n>`
-(default 100), `--event-sync` (low-latency WASAPI; only helps on solid wired
-endpoints), `--no-keepalive` (disable the inaudible pilot tone that keeps
-Bluetooth links awake), `--no-chime`, `--list`, `--extract-only <dir>`.
+**Latency** — right-click the tray icon → **Latency** to pick a preset
+(Reliable / Snappy / Minimal). The menu explains the trade-off inline; the
+choice persists. Leave it on Reliable unless haptics feel laggy (try Snappy on
+wired) or you want the absolute lowest latency (Minimal — wired only, may
+glitch on Bluetooth).
+
+Bridge flags (for manual launches): `--device <substring>` (default
+`DualSense`), `--map 12|34|auto`, `--buffer-ms <n>` (default 60),
+`--latency-ms <n>` (default 100), `--event-sync` (low-latency WASAPI; wired
+only), `--no-hid` (don't auto-enable the DualSense audio path over HID — leave
+that to DSX), `--no-chime`, `--list`, `--extract-only <dir>`. The tray Latency
+presets override the `--latency-ms`/`--buffer-ms`/`--event-sync` defaults.
 
 The in-game vibration options (Off / Reduced / On) are respected.
 
@@ -81,15 +88,17 @@ The in-game vibration options (Off / Reduced / On) are respected.
   USB. `HapticsBridge.exe --list` shows what it can see.
 - **Haptics feel doubled/smeared** — disable DSX's own Audio-To-Haptics for
   this game; the mod feeds the real waveforms already.
-- **Haptics work at first, then go dead (esp. Bluetooth)** — some BT audio
-  stacks idle the link on sustained digital silence and never resume. Since
-  0.3.3 the bridge streams an imperceptible keepalive tone to prevent this and
-  watches the device render clock, reopening the session automatically if the
-  endpoint stops consuming audio (`render clock frozen` in the log). If you
-  still see repeated `Reopening audio session` lines, the endpoint itself is
-  unstable — re-pair the controller or use USB.
-- **Feels laggy** — start the bridge with `--buffer-ms 30` (and, on wired,
-  optionally `--latency-ms 40`).
+- **Chime plays but nothing buzzes (wired, no DSX)** — the DualSense leaves its
+  audio path unpowered until told otherwise. Since 0.3.4 the bridge enables it
+  over HID automatically (`HID: audio haptics enabled` in the log), so wired
+  works with no DSX. If it's still silent, another app may own the pad — check
+  the log, or pass `--no-hid` and let DSX manage it.
+- **Haptics stall on Bluetooth** — the bridge watches the device render clock
+  and reopens the session if the endpoint stops consuming audio
+  (`render clock frozen` in the log). Repeated `Reopening audio session` lines
+  mean the endpoint itself is unstable — re-pair the controller or use USB.
+- **Feels laggy or crackly** — right-click the tray → **Latency** and pick
+  Snappy (wired) or step back to Reliable if a lower preset glitches.
 - **Diagnosis** — `BepInEx/LogOutput.log` (game side; look for
   `Connected to HapticsBridge` and `Haptic play:` lines) and
   `HapticsBridge.log` next to the bridge exe.

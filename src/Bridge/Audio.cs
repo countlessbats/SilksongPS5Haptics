@@ -82,31 +82,20 @@ namespace HapticsBridge
     /// IWaveProvider that reports the device's own mix format and writes the
     /// stereo haptic source into two chosen channels of each output frame.
     /// Always fills the requested count (silence on underrun) so playback never stalls.
-    /// Optionally mixes an imperceptible low-level pilot tone into the haptic
-    /// channels: some Bluetooth audio stacks idle the link on sustained digital
-    /// silence and never resume rendering, which freezes haptics until the
-    /// device is reconnected. The pilot keeps the stream "non-silent" so the
-    /// link stays awake. 100 Hz at -56 dBFS is far below actuator threshold.
     /// </summary>
     internal sealed class ChannelMapWaveProvider : IWaveProvider
     {
-        private const float PilotAmp = 0.0015f;
-        private const double PilotHz = 100.0;
-
         private readonly ISampleProvider source;
         private readonly int leftCh, rightCh;
         private readonly WaveFormat format;
-        private readonly bool keepalive;
-        private double pilotPhase;
         private float[] srcBuf = new float[0];
 
-        public ChannelMapWaveProvider(ISampleProvider stereoSource, WaveFormat deviceMixFormat, int leftCh, int rightCh, bool keepalive)
+        public ChannelMapWaveProvider(ISampleProvider stereoSource, WaveFormat deviceMixFormat, int leftCh, int rightCh)
         {
             source = stereoSource;
             format = deviceMixFormat;
             this.leftCh = leftCh;
             this.rightCh = rightCh;
-            this.keepalive = keepalive;
         }
 
         public WaveFormat WaveFormat { get { return format; } }
@@ -119,25 +108,11 @@ namespace HapticsBridge
             int srcFrames = source.Read(srcBuf, 0, srcNeeded) / 2;
 
             Array.Clear(buffer, offset, frames * format.BlockAlign);
-            double phaseStep = 2 * Math.PI * PilotHz / format.SampleRate;
-            for (int f = 0; f < frames; f++)
+            for (int f = 0; f < srcFrames; f++)
             {
-                float pilot = 0f;
-                if (keepalive)
-                {
-                    pilot = PilotAmp * (float)Math.Sin(pilotPhase);
-                    pilotPhase += phaseStep;
-                    if (pilotPhase > 2 * Math.PI) pilotPhase -= 2 * Math.PI;
-                }
-                float l = pilot, r = pilot;
-                if (f < srcFrames)
-                {
-                    l += srcBuf[f * 2];
-                    r += srcBuf[f * 2 + 1];
-                }
                 int frameByte = offset + f * format.BlockAlign;
-                WriteFloat(buffer, frameByte + leftCh * 4, l);
-                WriteFloat(buffer, frameByte + rightCh * 4, r);
+                WriteFloat(buffer, frameByte + leftCh * 4, srcBuf[f * 2]);
+                WriteFloat(buffer, frameByte + rightCh * 4, srcBuf[f * 2 + 1]);
             }
             return frames * format.BlockAlign;
         }
