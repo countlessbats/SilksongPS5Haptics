@@ -57,14 +57,24 @@ namespace HapticsBridge
             var bytes = new byte[samples.Count * 4];
             Buffer.BlockCopy(samples.ToArray(), 0, bytes, 0, bytes.Length);
             // Feed in chunks: the jitter buffer is much shorter than the chime.
+            // Deadline guards both waits — if the endpoint stops draining
+            // mid-chime (Bluetooth stall), bail out instead of spinning forever
+            // (the startup chime runs on the engine thread).
+            int deadline = Environment.TickCount + (int)(1000.0 * samples.Count / 2 / Program.SampleRate) + 5000;
             for (int off = 0; off < bytes.Length; off += 3840)
             {
                 while (buffer.BufferedDuration.TotalMilliseconds > 120)
+                {
+                    if (Environment.TickCount > deadline) return;
                     Thread.Sleep(5);
+                }
                 buffer.AddSamples(bytes, off, Math.Min(3840, bytes.Length - off));
             }
             while (buffer.BufferedDuration.TotalMilliseconds > 0)
+            {
+                if (Environment.TickCount > deadline) return;
                 Thread.Sleep(10);
+            }
         }
     }
 
@@ -72,20 +82,31 @@ namespace HapticsBridge
     /// IWaveProvider that reports the device's own mix format and writes the
     /// stereo haptic source into two chosen channels of each output frame.
     /// Always fills the requested count (silence on underrun) so playback never stalls.
+    /// Optionally mixes an imperceptible low-level pilot tone into the haptic
+    /// channels: some Bluetooth audio stacks idle the link on sustained digital
+    /// silence and never resume rendering, which freezes haptics until the
+    /// device is reconnected. The pilot keeps the stream "non-silent" so the
+    /// link stays awake. 100 Hz at -56 dBFS is far below actuator threshold.
     /// </summary>
     internal sealed class ChannelMapWaveProvider : IWaveProvider
     {
+        private const float PilotAmp = 0.0015f;
+        private const double PilotHz = 100.0;
+
         private readonly ISampleProvider source;
         private readonly int leftCh, rightCh;
         private readonly WaveFormat format;
+        private readonly bool keepalive;
+        private double pilotPhase;
         private float[] srcBuf = new float[0];
 
-        public ChannelMapWaveProvider(ISampleProvider stereoSource, WaveFormat deviceMixFormat, int leftCh, int rightCh)
+        public ChannelMapWaveProvider(ISampleProvider stereoSource, WaveFormat deviceMixFormat, int leftCh, int rightCh, bool keepalive)
         {
             source = stereoSource;
             format = deviceMixFormat;
             this.leftCh = leftCh;
             this.rightCh = rightCh;
+            this.keepalive = keepalive;
         }
 
         public WaveFormat WaveFormat { get { return format; } }
@@ -98,11 +119,25 @@ namespace HapticsBridge
             int srcFrames = source.Read(srcBuf, 0, srcNeeded) / 2;
 
             Array.Clear(buffer, offset, frames * format.BlockAlign);
-            for (int f = 0; f < srcFrames; f++)
+            double phaseStep = 2 * Math.PI * PilotHz / format.SampleRate;
+            for (int f = 0; f < frames; f++)
             {
+                float pilot = 0f;
+                if (keepalive)
+                {
+                    pilot = PilotAmp * (float)Math.Sin(pilotPhase);
+                    pilotPhase += phaseStep;
+                    if (pilotPhase > 2 * Math.PI) pilotPhase -= 2 * Math.PI;
+                }
+                float l = pilot, r = pilot;
+                if (f < srcFrames)
+                {
+                    l += srcBuf[f * 2];
+                    r += srcBuf[f * 2 + 1];
+                }
                 int frameByte = offset + f * format.BlockAlign;
-                WriteFloat(buffer, frameByte + leftCh * 4, srcBuf[f * 2]);
-                WriteFloat(buffer, frameByte + rightCh * 4, srcBuf[f * 2 + 1]);
+                WriteFloat(buffer, frameByte + leftCh * 4, l);
+                WriteFloat(buffer, frameByte + rightCh * 4, r);
             }
             return frames * format.BlockAlign;
         }

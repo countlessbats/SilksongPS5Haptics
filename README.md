@@ -67,8 +67,10 @@ Manual install: copy `files/BepInEx` from the zip over your game folder
 | `BridgePort` | 48111 | Localhost TCP port |
 
 Bridge flags: `--device <substring>` (default `DualSense`), `--map 12|34|auto`,
-`--buffer-ms <n>` (default 60, lower = less latency), `--no-chime`, `--list`,
-`--extract-only <dir>`.
+`--buffer-ms <n>` (default 60, lower = less latency), `--latency-ms <n>`
+(default 100), `--event-sync` (low-latency WASAPI; only helps on solid wired
+endpoints), `--no-keepalive` (disable the inaudible pilot tone that keeps
+Bluetooth links awake), `--no-chime`, `--list`, `--extract-only <dir>`.
 
 The in-game vibration options (Off / Reduced / On) are respected.
 
@@ -79,7 +81,15 @@ The in-game vibration options (Off / Reduced / On) are respected.
   USB. `HapticsBridge.exe --list` shows what it can see.
 - **Haptics feel doubled/smeared** — disable DSX's own Audio-To-Haptics for
   this game; the mod feeds the real waveforms already.
-- **Feels laggy** — start the bridge with `--buffer-ms 30`.
+- **Haptics work at first, then go dead (esp. Bluetooth)** — some BT audio
+  stacks idle the link on sustained digital silence and never resume. Since
+  0.3.3 the bridge streams an imperceptible keepalive tone to prevent this and
+  watches the device render clock, reopening the session automatically if the
+  endpoint stops consuming audio (`render clock frozen` in the log). If you
+  still see repeated `Reopening audio session` lines, the endpoint itself is
+  unstable — re-pair the controller or use USB.
+- **Feels laggy** — start the bridge with `--buffer-ms 30` (and, on wired,
+  optionally `--latency-ms 40`).
 - **Diagnosis** — `BepInEx/LogOutput.log` (game side; look for
   `Connected to HapticsBridge` and `Haptic play:` lines) and
   `HapticsBridge.log` next to the bridge exe.

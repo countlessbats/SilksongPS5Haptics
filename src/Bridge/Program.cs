@@ -179,6 +179,7 @@ namespace HapticsBridge
         private readonly int bufferMs;
         private readonly int latencyMs;
         private readonly bool eventSync;
+        private readonly bool keepalive;
         private readonly string map;
         private readonly bool chimeOnStart;
         private volatile bool stop;
@@ -214,6 +215,10 @@ namespace HapticsBridge
             // event-sync with --event-sync and tune latency with --latency-ms.
             latencyMs = int.TryParse(Program.GetArg(args, "--latency-ms"), out l) ? l : 100;
             eventSync = args.Contains("--event-sync");
+            // Imperceptible pilot tone on the haptic channels; keeps Bluetooth
+            // links from idling on digital silence (which freezes rendering on
+            // some BT stacks until the controller is reconnected).
+            keepalive = !args.Contains("--no-keepalive");
             map = Program.GetArg(args, "--map") ?? "auto";
             chimeOnStart = !args.Contains("--no-chime");
             try { File.WriteAllText(LogPath, ""); } catch { }
@@ -244,6 +249,8 @@ namespace HapticsBridge
             EnsureClips();
 
             bool firstChimePlayed = false;
+            int reopenDelayMs = 2000;
+            int sessionStartTick = Environment.TickCount;
             while (!stop)
             {
                 var device = FindDevice();
@@ -286,13 +293,14 @@ namespace HapticsBridge
                     ISampleProvider source = mixer;
                     if (mix.SampleRate != Program.SampleRate)
                         source = new WdlResamplingSampleProvider(source, mix.SampleRate);
-                    var provider = new ChannelMapWaveProvider(source, mix, leftCh, rightCh);
+                    var provider = new ChannelMapWaveProvider(source, mix, leftCh, rightCh, keepalive);
 
                     sessionDead = false;
+                    sessionStartTick = Environment.TickCount;
                     openedDeviceId = device.ID;
                     chimeBuffer = chime;
 
-                    Log(string.Format("Output: {0}-driven, {1} ms latency", eventSync ? "event" : "timer", latencyMs));
+                    Log(string.Format("Output: {0}-driven, {1} ms latency, keepalive {2}", eventSync ? "event" : "timer", latencyMs, keepalive ? "on" : "off"));
                     using (var output = new WasapiOut(device, AudioClientShareMode.Shared, eventSync, latencyMs))
                     {
                         output.PlaybackStopped += delegate (object s, StoppedEventArgs e)
@@ -303,7 +311,7 @@ namespace HapticsBridge
                         output.Init(provider);
                         output.Play();
 
-                        var watchdog = new Thread(delegate () { WatchdogLoop(chime); })
+                        var watchdog = new Thread(delegate () { WatchdogLoop(output); })
                         { IsBackground = true, Name = "HapticsWatchdog" };
                         watchdog.Start();
 
@@ -369,8 +377,14 @@ namespace HapticsBridge
                 }
                 if (!stop)
                 {
+                    // Back off if sessions are dying young (a wedged endpoint
+                    // that re-stalls on every reopen); reset once one survives.
+                    if (Environment.TickCount - sessionStartTick >= 60000)
+                        reopenDelayMs = 2000;
+                    else
+                        reopenDelayMs = Math.Min(reopenDelayMs * 2, 30000);
                     state = State.NoDevice;
-                    SleepInterruptible(2000);
+                    SleepInterruptible(reopenDelayMs);
                 }
             }
         }
@@ -424,11 +438,18 @@ namespace HapticsBridge
         }
 
         /// <summary>
-        /// Detects endpoint replacement, which happens when DSX recreates its
-        /// virtual device or a USB controller is unplugged/replugged.
+        /// Detects endpoint replacement (DSX recreating its virtual device, a
+        /// USB controller replug) and a frozen render clock. While the session
+        /// is playing, the device's hardware position always advances — even
+        /// through silence — so a position frozen across two ticks (~3s) means
+        /// the endpoint genuinely stopped consuming audio (the Bluetooth stall)
+        /// and the session must be reopened. Unlike the old buffered-bytes
+        /// check, the device clock cannot misfire on a quiet producer.
         /// </summary>
-        private void WatchdogLoop(BufferedWaveProvider chime)
+        private void WatchdogLoop(WasapiOut output)
         {
+            long lastPos = -1;
+            int frozenTicks = 0;
             while (!stop && !sessionDead)
             {
                 Thread.Sleep(1500);
@@ -442,6 +463,19 @@ namespace HapticsBridge
                         if (live == null) { KillSession("device removed"); return; }
                         if (live.ID != openedDeviceId) { KillSession("device replaced (new endpoint instance)"); return; }
                     }
+
+                    long pos = output.GetPosition();
+                    if (pos == lastPos)
+                    {
+                        if (++frozenTicks >= 2)
+                        {
+                            KillSession("render clock frozen (endpoint stopped consuming audio)");
+                            return;
+                        }
+                    }
+                    else
+                        frozenTicks = 0;
+                    lastPos = pos;
                 }
                 catch (Exception e)
                 {
