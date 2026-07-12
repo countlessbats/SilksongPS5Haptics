@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Microsoft.Win32.SafeHandles;
 
 namespace HapticsBridge
@@ -37,7 +38,8 @@ namespace HapticsBridge
 
         private static readonly object sync = new object();
         private static List<string> cachedPaths;
-        private static bool loggedAsserted, loggedNone;
+        private static readonly HashSet<string> badPaths = new HashSet<string>();
+        private static bool loggedAsserted, loggedNone, loggedTimeout;
 
         /// <summary>
         /// Writes the audio-haptics mode select to every USB DualSense.
@@ -76,7 +78,10 @@ namespace HapticsBridge
             try
             {
                 if (cachedPaths == null)
+                {
                     cachedPaths = FindDualSensePaths();
+                    badPaths.Clear();
+                }
                 int ok = 0;
                 foreach (var path in cachedPaths)
                     if (TryWriteModeSelect(path)) ok++;
@@ -88,7 +93,29 @@ namespace HapticsBridge
             }
         }
 
+        /// <summary>
+        /// Time-bounds the HID write so a wedged endpoint can't stall the caller.
+        /// A Bluetooth DualSense (audio path owned by DSX anyway) can block
+        /// CreateFile/Write on the USB-format report indefinitely; if that
+        /// happens we abandon the worker once and never touch that path again.
+        /// </summary>
         private static bool TryWriteModeSelect(string path)
+        {
+            if (badPaths.Contains(path)) return false;
+            bool ok = false;
+            var worker = new Thread(delegate () { try { ok = WriteModeSelect(path); } catch { } })
+            { IsBackground = true, Name = "HidWrite" };
+            worker.Start();
+            if (!worker.Join(300))
+            {
+                badPaths.Add(path);   // hung device — skip it from now on
+                if (!loggedTimeout) { loggedTimeout = true; Engine.Log("HID: a controller's write stalled (Bluetooth pad?); skipping it"); }
+                return false;
+            }
+            return ok;
+        }
+
+        private static bool WriteModeSelect(string path)
         {
             using (var handle = CreateFile(path, GENERIC_READ | GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero))
