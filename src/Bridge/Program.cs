@@ -223,6 +223,7 @@ namespace HapticsBridge
         private volatile int latencyMs;
         private volatile bool eventSync;
         private readonly bool hidAssert;
+        private readonly bool noExtract;
         private readonly string map;
         private readonly bool chimeOnStart;
         private volatile bool stop;
@@ -285,6 +286,10 @@ namespace HapticsBridge
             // enables audio haptics over HID itself (see DualSenseHid) instead
             // of depending on DSX. Disable if another app should own the pad.
             hidAssert = !args.Contains("--no-hid");
+            // Skip the first-run Silksong clip extraction: lets the bridge be
+            // used as a plain haptic-audio sink (e.g. the Hollow Knight preview
+            // jukebox) on machines that don't have Silksong installed.
+            noExtract = args.Contains("--no-extract");
             map = Program.GetArg(args, "--map") ?? "auto";
             chimeOnStart = !args.Contains("--no-chime");
             try { File.WriteAllText(LogPath, ""); } catch { }
@@ -357,7 +362,7 @@ namespace HapticsBridge
 
         private void Run()
         {
-            EnsureClips();
+            if (!noExtract) EnsureClips();
 
             bool firstChimePlayed = false;
             int reopenDelayMs = 2000;
