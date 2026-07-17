@@ -65,12 +65,19 @@ Manual install: copy `files/BepInEx` from the zip over your game folder
 | `KeepRumble` | false | Also fire normal rumble alongside haptics |
 | `AutoStartBridge` | true | Launch the tray bridge with the game |
 | `BridgePort` | 48111 | Localhost TCP port |
+| `BridgeBufferMs` | 60 | Jitter buffer (ms) — lower = less latency, more crackle-prone |
+| `BridgeLatencyMs` | 100 | WASAPI output latency (ms) — lower = snappier; very low can stall on Bluetooth |
+| `BridgeEventSync` | false | Low-latency event-driven WASAPI (wired only) |
 
-**Latency** — right-click the tray icon → **Latency** to pick a preset
-(Reliable / Snappy / Minimal). The menu explains the trade-off inline; the
-choice persists. Leave it on Reliable unless haptics feel laggy (try Snappy on
-wired) or you want the absolute lowest latency (Minimal — wired only, may
-glitch on Bluetooth).
+The three `Bridge*` latency settings are passed to the auto-started bridge, so
+you can tune latency from the config file — no command line needed. Defaults
+are safe; for the lowest latency on a stable **wired** connection, one user
+reports 10+ flawless hours at `BridgeBufferMs = 5`, `BridgeLatencyMs = 1`.
+
+**Latency (quick toggle)** — right-click the tray icon → **Latency** to pick a
+preset (Reliable / Snappy / Minimal). A tray preset overrides the config
+values above at runtime (it writes `latency.cfg` next to the bridge; delete
+that to fall back to your config).
 
 Bridge flags (for manual launches): `--device <substring>` (default
 `DualSense`), `--map 12|34|auto`, `--buffer-ms <n>` (default 60),

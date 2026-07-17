@@ -8,7 +8,7 @@ using UnityEngine;
 
 namespace SilksongPS5Haptics
 {
-    [BepInPlugin("com.will.silksong.ps5haptics", "Silksong PS5 Haptics", "0.3.4")]
+    [BepInPlugin("com.will.silksong.ps5haptics", "Silksong PS5 Haptics", "0.3.5")]
     public class PS5HapticsPlugin : BaseUnityPlugin
     {
         internal static ManualLogSource Log;
@@ -17,6 +17,9 @@ namespace SilksongPS5Haptics
         internal static ConfigEntry<int> BridgePort;
         internal static ConfigEntry<string> ClipsPath;
         internal static ConfigEntry<bool> AutoStartBridge;
+        internal static ConfigEntry<int> BridgeBufferMs;
+        internal static ConfigEntry<int> BridgeLatencyMs;
+        internal static ConfigEntry<bool> BridgeEventSync;
         internal static ConfigEntry<bool> SuspendInputWhenUnfocused;
 
         private void Awake()
@@ -34,6 +37,19 @@ namespace SilksongPS5Haptics
 
             AutoStartBridge = Config.Bind("General", "AutoStartBridge", true,
                 "Launch HapticsBridge.exe (system tray) automatically when the game starts.");
+
+            // Latency tuning passed to the auto-started bridge. Defaults are the
+            // safe values; lower = snappier but can crackle, and very low WASAPI
+            // latency may stall on Bluetooth. One user reports 10+ flawless hours
+            // at BridgeBufferMs=5, BridgeLatencyMs=1 (wired). These apply only
+            // when AutoStartBridge is true; picking a preset from the bridge's
+            // tray "Latency" menu overrides them at runtime.
+            BridgeBufferMs = Config.Bind("Latency", "BridgeBufferMs", 60,
+                "Jitter buffer in ms (lower = less latency, but more prone to crackle). Try 5 for minimum latency on a stable wired connection.");
+            BridgeLatencyMs = Config.Bind("Latency", "BridgeLatencyMs", 100,
+                "WASAPI output latency in ms (lower = snappier). Very low values (e.g. 1) work great wired but can wedge on Bluetooth.");
+            BridgeEventSync = Config.Bind("Latency", "BridgeEventSync", false,
+                "Use low-latency event-driven WASAPI. Wired endpoints only; can stall on Bluetooth.");
             SuspendInputWhenUnfocused = Config.Bind("Multi-instance", "SuspendInputWhenUnfocused", false,
                 "Ignore controller input while this game window is not focused. Enable on BOTH installs when running two instances (e.g. coop host+client) on one PC with one controller: whichever window you click gets the pad. Leave off for normal play or local two-player with two controllers.");
 
@@ -88,12 +104,16 @@ namespace SilksongPS5Haptics
                 }
                 if (File.Exists(exe))
                 {
-                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe)
+                    string args = string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "--port {0} --buffer-ms {1} --latency-ms {2}",
+                        BridgePort.Value, BridgeBufferMs.Value, BridgeLatencyMs.Value);
+                    if (BridgeEventSync.Value) args += " --event-sync";
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe, args)
                     {
                         UseShellExecute = true,
                         WorkingDirectory = Path.GetDirectoryName(exe),
                     });
-                    Log.LogInfo($"Launched bridge: {exe}");
+                    Log.LogInfo($"Launched bridge: {exe} {args}");
                 }
                 else
                 {
