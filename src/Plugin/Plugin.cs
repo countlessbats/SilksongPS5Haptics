@@ -8,7 +8,7 @@ using UnityEngine;
 
 namespace SilksongPS5Haptics
 {
-    [BepInPlugin("com.will.silksong.ps5haptics", "Silksong PS5 Haptics", "0.3.5")]
+    [BepInPlugin("com.will.silksong.ps5haptics", "Silksong PS5 Haptics", "0.3.6")]
     public class PS5HapticsPlugin : BaseUnityPlugin
     {
         internal static ManualLogSource Log;
@@ -85,9 +85,32 @@ namespace SilksongPS5Haptics
             }
         }
 
+        private System.Diagnostics.Process bridgeProcess;
+
+        private void OnApplicationQuit()
+        {
+            StopBridge();
+        }
+
         private void OnDestroy()
         {
             HapticEngine.Shutdown();
+            StopBridge();
+        }
+
+        // Close the bridge we started when the game quits. Without this the tray
+        // app lingers as a child of the game process, so Steam keeps showing the
+        // game as "Running" until you Stop it manually. Only the instance that
+        // actually launched the running bridge kills it (a second coop instance
+        // loses the mutex race, so its handle has already exited -> no-op).
+        private void StopBridge()
+        {
+            try
+            {
+                if (bridgeProcess != null && !bridgeProcess.HasExited)
+                    bridgeProcess.Kill();
+            }
+            catch { }
         }
 
         // The bridge is single-instance (mutex), so launching when one is
@@ -108,7 +131,7 @@ namespace SilksongPS5Haptics
                         "--port {0} --buffer-ms {1} --latency-ms {2}",
                         BridgePort.Value, BridgeBufferMs.Value, BridgeLatencyMs.Value);
                     if (BridgeEventSync.Value) args += " --event-sync";
-                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe, args)
+                    bridgeProcess = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe, args)
                     {
                         UseShellExecute = true,
                         WorkingDirectory = Path.GetDirectoryName(exe),
